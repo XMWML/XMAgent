@@ -209,7 +209,13 @@ class AnthropicProvider(Provider):
             elif isinstance(configured_tools, list):
                 options["tools"] = list(dict.fromkeys([*configured_tools, *enabled_web_tools]))
         env = dict(options.get("env") or {})
-        if self.settings.workspace:
+        # The built-in profile deliberately delegates authentication to the
+        # Claude Code installation used by this service process.  In that
+        # mode do not point the SDK at a workspace-local Claude config or
+        # inject process/profile API credentials: doing either would shadow
+        # the existing `claude login` session.
+        use_local_claude_login = bool(self.settings.extra.get("use_local_claude_code_login"))
+        if self.settings.workspace and not use_local_claude_login:
             config_dir = Path(self.settings.workspace) / ".claude-config"
             config_dir.mkdir(parents=True, exist_ok=True)
             try:
@@ -224,13 +230,21 @@ class AnthropicProvider(Provider):
         # SDK subprocesses merge options.env over their inherited process
         # environment. Never write an empty token here, because it would
         # silently disable a valid process-level credential.
-        auth_token = self.settings.api_key or os.getenv("ANTHROPIC_AUTH_TOKEN")
-        if auth_token:
-            env.setdefault("ANTHROPIC_AUTH_TOKEN", auth_token)
-        if self.settings.api_url:
-            env.setdefault("ANTHROPIC_BASE_URL", self.settings.api_url)
-        elif os.getenv("ANTHROPIC_BASE_URL"):
-            env.setdefault("ANTHROPIC_BASE_URL", os.environ["ANTHROPIC_BASE_URL"])
+        if use_local_claude_login:
+            # An explicit custom env entry could still accidentally override
+            # the OAuth-backed login.  Remove only these provider selectors;
+            # other administrator-provided SDK environment values remain.
+            env.pop("ANTHROPIC_AUTH_TOKEN", None)
+            env.pop("ANTHROPIC_BASE_URL", None)
+            env.pop("CLAUDE_CONFIG_DIR", None)
+        else:
+            auth_token = self.settings.api_key or os.getenv("ANTHROPIC_AUTH_TOKEN")
+            if auth_token:
+                env.setdefault("ANTHROPIC_AUTH_TOKEN", auth_token)
+            if self.settings.api_url:
+                env.setdefault("ANTHROPIC_BASE_URL", self.settings.api_url)
+            elif os.getenv("ANTHROPIC_BASE_URL"):
+                env.setdefault("ANTHROPIC_BASE_URL", os.environ["ANTHROPIC_BASE_URL"])
         options["env"] = {str(key): str(value) for key, value in env.items() if value is not None}
         if "setting_sources" not in options and (not fields or "setting_sources" in fields):
             options["setting_sources"] = ["project"]

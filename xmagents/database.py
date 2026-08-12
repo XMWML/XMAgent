@@ -156,6 +156,26 @@ class Database:
         with self.connect() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.executescript(SCHEMA)
+            # This protected profile intentionally has no secret.  Selecting
+            # it tells the Claude SDK child to use the service user's existing
+            # Claude Code login rather than an API token stored by XMAgent.
+            now = utcnow()
+            connection.execute(
+                "INSERT OR IGNORE INTO api_profiles(id,name,provider,base_url,models_json,secret,options_json,enabled,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "builtin-claude-code",
+                    "本机 Claude Code 登录",
+                    "anthropic",
+                    None,
+                    "[]",
+                    None,
+                    '{"use_local_claude_code_login":true}',
+                    1,
+                    now,
+                    now,
+                ),
+            )
         self._chmod_database_files()
 
     @contextmanager

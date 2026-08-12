@@ -10,6 +10,7 @@ import inspect
 import asyncio
 import hmac
 import secrets
+import unicodedata
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -46,7 +47,10 @@ class AppService:
         self.plugin_loader = PluginLoader(self.paths.root / "plugins")
         self._runtimes: dict[str, AgentRuntime] = {}
         self._channel_tasks: dict[str, asyncio.Task[Any]] = {}
-        self._qr_sessions: dict[str, Any] = {}
+        # A QR code has one mutable login session.  Terminal snapshots are
+        # retained briefly so overlapping browser polls cannot create a second
+        # channel after confirmation.
+        self._qr_sessions: dict[str, dict[str, Any]] = {}
         self._outbox_task: asyncio.Task[Any] | None = None
         self._outbox_wakeup = asyncio.Event()
         # Capability values intentionally live only for this service process.
@@ -112,7 +116,10 @@ class AppService:
             except Exception as error:
                 self.db.audit("channel_stop_failed", detail={"error": redact_text(error)})
         self.channels.clear()
-        for session in list(self._qr_sessions.values()):
+        for item in list(self._qr_sessions.values()):
+            session = item.get("session")
+            if session is None:
+                continue
             try:
                 await session.close()
             except Exception:
@@ -420,45 +427,82 @@ class AppService:
         from .channels.wechat import WeChatQRLoginSession
 
         session = WeChatQRLoginSession(base_url or "https://ilinkai.weixin.qq.com")
-        snapshot = await session.start()
+        try:
+            snapshot = await session.start()
+        except Exception:
+            await session.close()
+            raise
         login_id = uuid.uuid4().hex
-        self._qr_sessions[login_id] = session
+        self._qr_sessions[login_id] = {
+            "session": session,
+            "lock": asyncio.Lock(),
+            "final": None,
+        }
         snapshot["login_id"] = login_id
+        # This endpoint only starts a login and must never expose a token if a
+        # provider implementation happens to return one prematurely.
+        snapshot.pop("bot_token", None)
         return snapshot
 
     async def poll_wechat_qr(self, login_id: str) -> dict[str, Any]:
-        session = self._qr_sessions.get(login_id)
-        if not session:
+        state = self._qr_sessions.get(login_id)
+        if not state:
             raise KeyError(login_id)
-        snapshot = await session.poll_once()
-        if snapshot.get("state") == "confirmed" and snapshot.get("bot_token"):
-            account_id = uuid.uuid4().hex
-            self.create_channel("wechat", f"微信 {account_id[:8]}", token=snapshot["bot_token"], base_url=snapshot.get("base_url"), account_id=account_id)
-            try:
-                await self.start_channel(account_id)
-            except Exception as error:
-                self.update_channel(account_id, {"status": "error"})
-                self.db.audit("wechat_qr_channel_start_failed", target=account_id, detail={"error": redact_text(error)})
-                snapshot["channel_error"] = "微信已绑定，但自动启动失败；请在渠道页重新启动。"
-            snapshot["account_id"] = account_id
-            # QR snapshots are rendered in the administrator browser and may
-            # be retained by a proxy/browser cache. The durable channel row
-            # has the token; never expose it through this management API.
+        # Browsers can overlap polling requests while a QR code transitions to
+        # confirmed.  Serialising the whole confirmation path is important:
+        # channel creation and automatic start both have side effects.
+        async with state["lock"]:
+            final = state.get("final")
+            if final is not None:
+                return dict(final)
+            session = state.get("session")
+            if session is None:
+                raise KeyError(login_id)
+            snapshot = await session.poll_once()
+            if snapshot.get("state") == "confirmed" and snapshot.get("bot_token"):
+                account_id = uuid.uuid4().hex
+                self.create_channel(
+                    "wechat",
+                    f"微信 {account_id[:8]}",
+                    token=snapshot["bot_token"],
+                    base_url=snapshot.get("base_url"),
+                    account_id=account_id,
+                )
+                try:
+                    await self.start_channel(account_id)
+                except Exception as error:
+                    self.update_channel(account_id, {"status": "error"})
+                    self.db.audit("wechat_qr_channel_start_failed", target=account_id, detail={"error": redact_text(error)})
+                    snapshot["channel_error"] = "微信已绑定，但自动启动失败；请在渠道页重新启动。"
+                snapshot["account_id"] = account_id
+
             snapshot.pop("bot_token", None)
-        else:
-            snapshot.pop("bot_token", None)
-        if snapshot.get("state") in {"confirmed", "expired", "error"}:
-            await session.close()
-            self._qr_sessions.pop(login_id, None)
-        snapshot["login_id"] = login_id
-        return snapshot
+            snapshot["login_id"] = login_id
+            if snapshot.get("state") in {"confirmed", "expired", "error"}:
+                # Keep the public terminal result, rather than removing the
+                # login immediately.  A late poll receives the same account
+                # id and cannot accidentally create a second channel.
+                state["final"] = dict(snapshot)
+                state["session"] = None
+                await session.close()
+            return dict(snapshot)
 
     async def submit_wechat_verify(self, login_id: str, code: str) -> dict[str, Any]:
-        session = self._qr_sessions.get(login_id)
-        if not session:
+        state = self._qr_sessions.get(login_id)
+        if not state:
             raise KeyError(login_id)
-        await session.submit_verify_code(code)
-        return session.snapshot()
+        async with state["lock"]:
+            final = state.get("final")
+            if final is not None:
+                return dict(final)
+            session = state.get("session")
+            if session is None:
+                raise KeyError(login_id)
+            await session.submit_verify_code(code)
+            snapshot = session.snapshot()
+            snapshot.pop("bot_token", None)
+            snapshot["login_id"] = login_id
+            return snapshot
 
     def _record_inbox(self, account_id: str, message: Any) -> bool:
         external_id = str(message.external_id)
@@ -508,10 +552,49 @@ class AppService:
             (redact_text(error), account_id, str(external_id)),
         )
 
+    def inbox_overview(self, *, limit: int = 12) -> dict[str, Any]:
+        """Return dashboard-safe counts and a compact recent inbound list."""
+
+        rows = self.db.fetchall(
+            "SELECT i.id,i.account_id,i.external_event_id,i.peer_id,i.state,i.error,i.received_at,i.processed_at,i.payload_json,"
+            "c.channel,c.name AS account_name,p.display_name,p.external_id "
+            "FROM inbox i JOIN channel_accounts c ON c.id=i.account_id "
+            "LEFT JOIN remote_peers p ON p.account_id=i.account_id AND p.external_id=i.peer_id "
+            "ORDER BY i.received_at DESC LIMIT ?",
+            (max(1, min(limit, 200)),),
+        )
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            payload = self.db.loads(item.pop("payload_json", ""), {})
+            summary = str(payload.get("text") or payload.get("caption") or "")
+            item["summary"] = redact_text(summary)[:500]
+            item["attachment_count"] = len(payload.get("attachments") or [])
+            result.append(item)
+        counts = self.db.fetchone(
+            "SELECT COUNT(*) AS total,"
+            "SUM(CASE WHEN state='received' THEN 1 ELSE 0 END) AS pending "
+            "FROM inbox"
+        )
+        return {
+            "total": int(counts["total"] if counts and counts["total"] is not None else 0),
+            "pending": int(counts["pending"] if counts and counts["pending"] is not None else 0),
+            "recent": result,
+        }
+
+    def inbox(self, *, limit: int = 12) -> list[dict[str, Any]]:
+        """Backward-compatible recent inbound records used by the history API."""
+
+        return self.inbox_overview(limit=limit)["recent"]
+
     def _agent_settings(self, row: dict[str, Any]) -> AgentSettings:
         config = self.db.loads(row.get("config_json"), {})
         profile = None
-        if row.get("api_profile_id"):
+        if row.get("api_profile_id") == "builtin-claude-code":
+            # Do not inject an API key or base URL.  Claude Code uses the
+            # existing login state available to the service user.
+            config.setdefault("use_local_claude_code_login", True)
+        elif row.get("api_profile_id"):
             profile = self.db.fetchone("SELECT * FROM api_profiles WHERE id=?", (row["api_profile_id"],))
         if profile:
             config = {**self.db.loads(profile["options_json"], {}), **config}
@@ -924,11 +1007,8 @@ class AppService:
         agent_binding = self.binding_for_peer(peer["id"])
         if not agent_binding and (channel == "wechat" or is_allowed_group):
             label = getattr(message, "sender_name", "") or (f"Telegram 群组-{message.peer_id}" if is_allowed_group else f"微信-{message.peer_id}")
-            agent = self.create_agent(label)
-            self.db.execute("UPDATE remote_peers SET approved=1 WHERE id=?", (peer["id"],))
-            binding_id = uuid.uuid4().hex
-            self.db.execute("INSERT INTO agent_bindings(id,agent_id,peer_id,active,created_at) VALUES(?,?,?,?,?)", (binding_id, agent["id"], peer["id"], 1, utcnow()))
-            agent_binding = self.binding_for_peer(peer["id"])
+            agent = self.create_agent(self._next_available_agent_name(label, fallback_id=str(peer["id"])))
+            agent_binding = self.bind_peer(str(peer["id"]), str(agent["id"]))
         # All attachment paths injected into prompts must be files verified in
         # the bound workspace.  This matters for a first WeChat message: its
         # Agent is created just above, so downloading earlier would stage
@@ -1295,7 +1375,9 @@ class AppService:
             item["models"] = self.db.loads(item.pop("models_json"), [])
             item["options"] = redact_mapping(self.db.loads(item.pop("options_json"), {}))
             item["secret_configured"] = bool(self.db.fetchone("SELECT secret FROM api_profiles WHERE id=? AND secret IS NOT NULL AND secret != ''", (item["id"],)))
+            item["builtin"] = item["id"] == "builtin-claude-code"
             rows.append(item)
+        rows.sort(key=lambda item: (not item["builtin"], str(item["name"]).casefold()))
         return rows
 
     def create_api_profile(self, *, name: str, provider: str, base_url: str | None = None,
@@ -1312,6 +1394,8 @@ class AppService:
         return next(item for item in self.list_api_profiles() if item["id"] == profile_id)
 
     def update_api_profile(self, profile_id: str, values: dict[str, Any]) -> dict[str, Any]:
+        if profile_id == "builtin-claude-code":
+            raise ValueError("内置 Claude Code 登录 profile 不能编辑")
         row = self._row("api_profiles", profile_id)
         if not row:
             raise KeyError(profile_id)
@@ -1335,6 +1419,8 @@ class AppService:
         return next(item for item in self.list_api_profiles() if item["id"] == profile_id)
 
     def delete_api_profile(self, profile_id: str) -> None:
+        if profile_id == "builtin-claude-code":
+            raise ValueError("内置 Claude Code 登录 profile 不能删除")
         agent_ids = [str(item["id"]) for item in self.db.fetchall("SELECT id FROM agents WHERE api_profile_id=?", (profile_id,))]
         self.db.execute("DELETE FROM api_profiles WHERE id=?", (profile_id,))
         for agent_id in agent_ids:
@@ -1342,11 +1428,60 @@ class AppService:
         self.db.audit("api_profile_deleted", target=profile_id)
 
     # ---- agents and peers ---------------------------------------------
-    def create_agent(self, name: str, *, provider: str = "anthropic", model: str | None = None,
-                     api_profile_id: str | None = None, config: dict[str, Any] | None = None,
-                     agent_id: str | None = None) -> dict[str, Any]:
-        agent_id = agent_id or uuid.uuid4().hex
-        workspace = self.paths.workspaces / agent_id
+    @staticmethod
+    def _normalise_agent_name(name: Any) -> str:
+        """Return an Agent name that is also safe to use as one directory name."""
+
+        value = unicodedata.normalize("NFC", str(name or "")).strip()
+        if not value:
+            raise ValueError("Agent 名称不能为空")
+        if len(value) > 120:
+            raise ValueError("Agent 名称不能超过 120 个字符")
+        if value in {".", ".."} or "/" in value or "\\" in value or any(ord(char) < 32 for char in value):
+            raise ValueError("Agent 名称不能包含路径分隔符或控制字符")
+        return value
+
+    @staticmethod
+    def _agent_name_key(name: str) -> str:
+        return unicodedata.normalize("NFC", name).casefold()
+
+    def _agent_name_exists(self, name: str, *, excluding_id: str | None = None) -> bool:
+        key = self._agent_name_key(name)
+        for row in self.db.fetchall("SELECT id,name FROM agents"):
+            if excluding_id and str(row["id"]) == excluding_id:
+                continue
+            if self._agent_name_key(str(row["name"])) == key:
+                return True
+        return False
+
+    def _require_available_agent_name(self, name: str, *, excluding_id: str | None = None) -> None:
+        if self._agent_name_exists(name, excluding_id=excluding_id):
+            raise ValueError("Agent 名称已存在")
+
+    def _next_available_agent_name(self, base_name: Any, *, fallback_id: str) -> str:
+        """Choose a readable unique name for an automatically created Agent."""
+
+        try:
+            base = self._normalise_agent_name(base_name)
+        except ValueError:
+            base = f"Agent-{fallback_id[:8]}"
+        if not self._agent_name_exists(base):
+            return base
+        index = 2
+        while True:
+            suffix = f" ({index})"
+            candidate = f"{base[:120 - len(suffix)]}{suffix}"
+            if not self._agent_name_exists(candidate):
+                return candidate
+            index += 1
+
+    def _workspace_for_agent_name(self, name: str) -> Path:
+        # ``_normalise_agent_name`` makes this a direct child of workspaces;
+        # names intentionally remain readable, including Chinese characters.
+        return self.paths.workspaces / self._normalise_agent_name(name)
+
+    @staticmethod
+    def _initialise_workspace(workspace: Path) -> None:
         workspace.mkdir(parents=True, exist_ok=True)
         (workspace / "uploads").mkdir(exist_ok=True)
         (workspace / "CLAUDE.md").touch(exist_ok=True)
@@ -1354,6 +1489,36 @@ class AppService:
             workspace.chmod(0o700)
         except OSError:
             pass
+
+    def _rename_agent_workspace(self, row: dict[str, Any], new_name: str) -> Path:
+        """Move one managed workspace to the directory derived from its name."""
+
+        root = self.paths.workspaces.resolve()
+        source = Path(str(row["workspace"])).resolve()
+        target = self._workspace_for_agent_name(new_name)
+        target_resolved = target.resolve()
+        if source == target_resolved:
+            self._initialise_workspace(target)
+            return target
+        if source == root or root not in source.parents:
+            raise ValueError("Agent 工作目录不在 data/workspaces 内，无法按名称迁移")
+        if target.exists():
+            raise ValueError("同名 Agent 的工作目录已存在")
+        if source.exists():
+            source.rename(target)
+        self._initialise_workspace(target)
+        return target
+
+    def create_agent(self, name: str, *, provider: str = "anthropic", model: str | None = None,
+                     api_profile_id: str | None = None, config: dict[str, Any] | None = None,
+                     agent_id: str | None = None) -> dict[str, Any]:
+        name = self._normalise_agent_name(name)
+        self._require_available_agent_name(name)
+        agent_id = agent_id or uuid.uuid4().hex
+        workspace = self._workspace_for_agent_name(name)
+        if workspace.exists():
+            raise ValueError("同名 Agent 的工作目录已存在")
+        self._initialise_workspace(workspace)
         now = utcnow()
         config = dict(config or {})
         permission_mode = str(config.get("permission_mode") or "bypassPermissions")
@@ -1384,6 +1549,11 @@ class AppService:
         row = self._row("agents", agent_id)
         if not row:
             raise KeyError(agent_id)
+        new_name = str(row["name"])
+        if "name" in updates:
+            new_name = self._normalise_agent_name(updates["name"])
+            self._require_available_agent_name(new_name, excluding_id=agent_id)
+            updates["name"] = new_name
         if "config" in values:
             advanced = (values["config"] or {}).get("advanced_python")
             if advanced:
@@ -1392,6 +1562,13 @@ class AppService:
                 except SyntaxError as error:
                     raise ValueError(f"高级 Python 配置语法错误，第 {error.lineno} 行：{error.msg}") from error
             updates["config_json"] = self.db.json(values["config"])
+        # Workspace paths follow names.  The WebUI submits the name on each
+        # save, so an existing legacy workspace is migrated when its Agent is
+        # next saved without moving files for unrelated setting changes.
+        expected_workspace = self._workspace_for_agent_name(new_name)
+        current_workspace = Path(str(row["workspace"])).resolve()
+        if "name" in updates and current_workspace != expected_workspace.resolve():
+            updates["workspace"] = str(self._rename_agent_workspace(row, new_name))
         if updates:
             updates["updated_at"] = utcnow()
             assignments = ",".join(f"{key}=?" for key in updates)
@@ -1436,23 +1613,89 @@ class AppService:
         )
         return self._row("remote_peers", peer_id) or {}
 
+    def list_bindings(self, *, peer_id: str | None = None, agent_id: str | None = None,
+                      active_only: bool = True) -> list[dict[str, Any]]:
+        """List channel-peer routing rows with Agent and channel details."""
+
+        clauses: list[str] = []
+        args: list[Any] = []
+        if peer_id:
+            clauses.append("b.peer_id=?")
+            args.append(peer_id)
+        if agent_id:
+            clauses.append("b.agent_id=?")
+            args.append(agent_id)
+        if active_only:
+            clauses.append("b.active=1")
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = self.db.fetchall(
+            "SELECT b.id,b.agent_id,b.peer_id,b.active,b.created_at,"
+            "a.name AS agent_name,a.workspace,p.account_id,p.external_id,p.chat_id,p.display_name,p.kind,p.approved,"
+            "c.channel,c.name AS account_name "
+            "FROM agent_bindings b JOIN agents a ON a.id=b.agent_id "
+            "JOIN remote_peers p ON p.id=b.peer_id JOIN channel_accounts c ON c.id=p.account_id"
+            + where + " ORDER BY b.created_at DESC",
+            tuple(args),
+        )
+        return [dict(row) for row in rows]
+
+    def bind_peer(self, peer_id: str, agent_id: str, *, approve: bool = True) -> dict[str, Any]:
+        """Make exactly one Agent the active destination for a channel peer."""
+
+        peer = self._row("remote_peers", peer_id)
+        if not peer:
+            raise KeyError(peer_id)
+        agent = self._row("agents", agent_id)
+        if not agent:
+            raise KeyError(agent_id)
+        now = utcnow()
+        # ``peer_id`` is globally unique in the schema: a peer has one route,
+        # rather than an append-only binding history.  Rebinding therefore
+        # updates that row in place instead of inserting a second row.
+        existing = self.db.fetchone("SELECT id FROM agent_bindings WHERE peer_id=?", (peer_id,))
+        if existing:
+            self.db.execute("UPDATE agent_bindings SET agent_id=?,active=1,created_at=? WHERE id=?", (agent_id, now, existing["id"]))
+            binding_id = str(existing["id"])
+        else:
+            binding_id = uuid.uuid4().hex
+            self.db.execute(
+                "INSERT INTO agent_bindings(id,agent_id,peer_id,active,created_at) VALUES(?,?,?,?,?)",
+                (binding_id, agent_id, peer_id, 1, now),
+            )
+        if approve:
+            self.db.execute("UPDATE remote_peers SET approved=1,updated_at=? WHERE id=?", (now, peer_id))
+        self.db.audit("peer_bound", target=peer_id, detail={"agent_id": agent_id, "approved": bool(approve)})
+        return next(item for item in self.list_bindings(peer_id=peer_id) if item["id"] == binding_id)
+
+    def unbind_peer(self, peer_id: str) -> bool:
+        """Remove the active route while retaining the peer approval record."""
+
+        changed = self.db.execute("UPDATE agent_bindings SET active=0 WHERE peer_id=? AND active=1", (peer_id,))
+        if changed:
+            self.db.audit("peer_unbound", target=peer_id)
+        return bool(changed)
+
     def approve_peer(self, peer_id: str, agent_id: str | None = None, agent_name: str | None = None) -> dict[str, Any]:
         peer = self._row("remote_peers", peer_id)
         if not peer:
             raise KeyError(peer_id)
         if not agent_id:
-            agent = self.create_agent(agent_name or peer.get("display_name") or f"agent-{peer_id[:8]}")
+            agent = self.create_agent(self._next_available_agent_name(agent_name or peer.get("display_name"), fallback_id=peer_id))
             agent_id = agent["id"]
-        self.db.execute("UPDATE remote_peers SET approved=1,updated_at=? WHERE id=?", (utcnow(), peer_id))
-        binding_id = uuid.uuid4().hex
-        self.db.execute("INSERT OR REPLACE INTO agent_bindings(id,agent_id,peer_id,active,created_at) VALUES(?,?,?,?,?)",
-                        (binding_id, agent_id, peer_id, 1, utcnow()))
+        self.bind_peer(peer_id, agent_id, approve=True)
         self.db.audit("peer_approved", target=peer_id, detail={"agent_id": agent_id})
         return self._row("agents", agent_id) or {}
 
     def binding_for_peer(self, peer_id: str) -> dict[str, Any] | None:
-        row = self.db.fetchone("SELECT a.*,p.account_id,p.external_id,p.chat_id,p.kind,p.approved FROM agents a JOIN agent_bindings b ON b.agent_id=a.id JOIN remote_peers p ON p.id=b.peer_id WHERE b.peer_id=? AND b.active=1", (peer_id,))
-        return self._decode_row(dict(row)) if row else None
+        rows = self.list_bindings(peer_id=peer_id)
+        if not rows:
+            return None
+        binding = rows[0]
+        # Preserve the historical shape used by routing/runtime callers: it is
+        # an Agent row enriched with peer fields, not only a binding row.
+        agent = self._decode_row(self._row("agents", str(binding["agent_id"])) or {})
+        agent.update({key: binding[key] for key in ("account_id", "external_id", "chat_id", "kind", "approved")})
+        return agent
 
     # ---- history / queue ----------------------------------------------
     def conversation(self, agent_id: str, route_key: str) -> dict[str, Any]:

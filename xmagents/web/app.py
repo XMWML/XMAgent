@@ -152,6 +152,7 @@ def create_app(service: AppService | None = None) -> FastAPI:
             _set_csrf_cookie(response, request, csrf_token)
             return response
         csrf_token = _csrf_token(request)
+        inbox_overview = service.inbox_overview(limit=12)
         response = templates.TemplateResponse(request=request, name="dashboard.html", context={
             "configured": service.configured,
             "agents": service.list_agents(),
@@ -163,6 +164,9 @@ def create_app(service: AppService | None = None) -> FastAPI:
             "plugins": [item for item in service.plugin_loader.list()],
             "knowledge": [dict(row) for row in service.db.fetchall("SELECT * FROM knowledge_bases ORDER BY created_at DESC")],
             "outbox": service.outbox(limit=12),
+            "inbox": inbox_overview["recent"],
+            "inbox_total": inbox_overview["total"],
+            "inbox_pending": inbox_overview["pending"],
             "csrf_token": csrf_token,
         })
         _set_csrf_cookie(response, request, csrf_token)
@@ -236,9 +240,16 @@ def create_app(service: AppService | None = None) -> FastAPI:
 
     @app.get("/api/dashboard")
     async def dashboard(_: AppService = Depends(require_auth)):
+        inbox_overview = service.inbox_overview(limit=12)
         return {"agents": service.list_agents(), "channels": service.list_channels(), "schedules": service.scheduler.list(),
                 "pending": [dict(row) for row in service.db.fetchall("SELECT * FROM remote_peers WHERE approved=0 ORDER BY created_at DESC")],
-                "outbox_pending": service.db.fetchone("SELECT COUNT(*) AS count FROM outbox WHERE state='pending'")["count"]}
+                "outbox_pending": service.db.fetchone("SELECT COUNT(*) AS count FROM outbox WHERE state IN ('pending','leased','deferred')")["count"],
+                "inbox_total": inbox_overview["total"], "inbox_pending": inbox_overview["pending"],
+                "inbox": inbox_overview["recent"]}
+
+    @app.get("/api/inbox")
+    async def inbox(limit: int = 100, _: AppService = Depends(require_auth)):
+        return service.inbox(limit=max(1, min(limit, 200)))
 
     @app.get("/api/agents")
     async def agents(_: AppService = Depends(require_auth)):
@@ -256,8 +267,11 @@ def create_app(service: AppService | None = None) -> FastAPI:
         for key in ("permission_mode", "effort", "memory_enabled", "knowledge_base_id"):
             if key in payload:
                 config[key] = payload[key]
-        return service.create_agent(name, provider=str(payload.get("provider", "anthropic")), model=payload.get("model"),
-                                    api_profile_id=payload.get("api_profile_id"), config=config)
+        try:
+            return service.create_agent(name, provider=str(payload.get("provider", "anthropic")), model=payload.get("model"),
+                                        api_profile_id=payload.get("api_profile_id"), config=config)
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from error
 
     @app.patch("/api/agents/{agent_id}")
     async def update_agent(agent_id: str, payload: dict[str, Any], _: AppService = Depends(require_auth)):
@@ -376,6 +390,26 @@ def create_app(service: AppService | None = None) -> FastAPI:
     async def pending(_: AppService = Depends(require_auth)):
         return [dict(row) for row in service.db.fetchall("SELECT p.*,c.channel,c.name AS account_name FROM remote_peers p JOIN channel_accounts c ON c.id=p.account_id WHERE p.approved=0 ORDER BY p.created_at DESC")]
 
+    @app.get("/api/bindings")
+    async def bindings(peer_id: str | None = None, agent_id: str | None = None, _: AppService = Depends(require_auth)):
+        """Return the explicit channel-peer to Agent routing table."""
+
+        return service.list_bindings(peer_id=peer_id, agent_id=agent_id)
+
+    @app.post("/api/bindings/{peer_id}")
+    async def bind_peer(peer_id: str, payload: dict[str, Any], _: AppService = Depends(require_auth)):
+        agent_id = str(payload.get("agent_id") or "").strip()
+        if not agent_id:
+            raise HTTPException(400, "agent_id 不能为空")
+        try:
+            return service.bind_peer(peer_id, agent_id, approve=bool(payload.get("approve", True)))
+        except KeyError as error:
+            raise HTTPException(404, "渠道用户或 Agent 不存在") from error
+
+    @app.delete("/api/bindings/{peer_id}")
+    async def unbind_peer(peer_id: str, _: AppService = Depends(require_auth)):
+        return {"ok": service.unbind_peer(peer_id)}
+
     @app.post("/api/pending/{peer_id}/approve")
     async def approve(peer_id: str, payload: dict[str, Any] | None = None, _: AppService = Depends(require_auth)):
         try:
@@ -403,12 +437,17 @@ def create_app(service: AppService | None = None) -> FastAPI:
             if "options" in payload:
                 payload["options"] = _as_dict(payload["options"], field="options")
             return service.update_api_profile(profile_id, payload)
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from error
         except KeyError:
             raise HTTPException(404, "API 配置不存在")
 
     @app.delete("/api/apis/{profile_id}")
     async def delete_api(profile_id: str, _: AppService = Depends(require_auth)):
-        service.delete_api_profile(profile_id)
+        try:
+            service.delete_api_profile(profile_id)
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from error
         return {"ok": True}
 
     @app.get("/api/mcp")
