@@ -157,7 +157,7 @@ def create_app(service: AppService | None = None) -> FastAPI:
             "configured": service.configured,
             "agents": service.list_agents(),
             "channels": service.list_channels(),
-            "pending": [dict(row) for row in service.db.fetchall("SELECT * FROM remote_peers WHERE approved=0 ORDER BY created_at DESC")],
+            "pending": service.list_unbound_peers(),
             "schedules": service.scheduler.list(),
             "apis": service.list_api_profiles(),
             "mcp_servers": service.list_mcp_servers(),
@@ -242,7 +242,7 @@ def create_app(service: AppService | None = None) -> FastAPI:
     async def dashboard(_: AppService = Depends(require_auth)):
         inbox_overview = service.inbox_overview(limit=12)
         return {"agents": service.list_agents(), "channels": service.list_channels(), "schedules": service.scheduler.list(),
-                "pending": [dict(row) for row in service.db.fetchall("SELECT * FROM remote_peers WHERE approved=0 ORDER BY created_at DESC")],
+                "pending": service.list_unbound_peers(),
                 "outbox_pending": service.db.fetchone("SELECT COUNT(*) AS count FROM outbox WHERE state IN ('pending','leased','deferred')")["count"],
                 "inbox_total": inbox_overview["total"], "inbox_pending": inbox_overview["pending"],
                 "inbox": inbox_overview["recent"]}
@@ -388,7 +388,7 @@ def create_app(service: AppService | None = None) -> FastAPI:
 
     @app.get("/api/pending")
     async def pending(_: AppService = Depends(require_auth)):
-        return [dict(row) for row in service.db.fetchall("SELECT p.*,c.channel,c.name AS account_name FROM remote_peers p JOIN channel_accounts c ON c.id=p.account_id WHERE p.approved=0 ORDER BY p.created_at DESC")]
+        return service.list_unbound_peers()
 
     @app.get("/api/bindings")
     async def bindings(peer_id: str | None = None, agent_id: str | None = None, _: AppService = Depends(require_auth)):
@@ -415,7 +415,7 @@ def create_app(service: AppService | None = None) -> FastAPI:
         try:
             return service.approve_peer(peer_id, (payload or {}).get("agent_id"), (payload or {}).get("agent_name"))
         except KeyError:
-            raise HTTPException(404, "待审批用户不存在")
+            raise HTTPException(404, "待绑定渠道用户不存在")
 
     @app.get("/api/apis")
     async def apis(_: AppService = Depends(require_auth)):

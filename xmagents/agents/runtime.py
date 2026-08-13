@@ -13,6 +13,7 @@ import inspect
 import json
 import os
 import re
+import shutil
 import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -209,12 +210,23 @@ class AnthropicProvider(Provider):
             elif isinstance(configured_tools, list):
                 options["tools"] = list(dict.fromkeys([*configured_tools, *enabled_web_tools]))
         env = dict(options.get("env") or {})
-        # The built-in profile deliberately delegates authentication to the
-        # Claude Code installation used by this service process.  In that
-        # mode do not point the SDK at a workspace-local Claude config or
-        # inject process/profile API credentials: doing either would shadow
-        # the existing `claude login` session.
-        use_local_claude_login = bool(self.settings.extra.get("use_local_claude_code_login"))
+        # ``use_local_claude_code_login`` was the original built-in profile
+        # marker.  It now means "use the service process authentication as
+        # supplied": that can be an existing Claude login, or inherited
+        # ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL billing credentials.
+        # Keep it as a compatibility marker, without stripping inherited env.
+        use_local_claude_login = bool(
+            self.settings.extra.get("use_local_claude_code")
+            or self.settings.extra.get("use_local_claude_code_login")
+        )
+        if use_local_claude_login and (not fields or "cli_path" in fields):
+            # The SDK bundles a CLI as a fallback, but this profile represents
+            # the Claude Code installation owned by the service user. Prefer
+            # that executable when it is on PATH so its version, login and API
+            # billing behavior match `claude` used by the administrator.
+            local_cli = shutil.which("claude")
+            if local_cli:
+                options.setdefault("cli_path", local_cli)
         if self.settings.workspace and not use_local_claude_login:
             config_dir = Path(self.settings.workspace) / ".claude-config"
             config_dir.mkdir(parents=True, exist_ok=True)
@@ -229,15 +241,11 @@ class AnthropicProvider(Provider):
         env.update({key: value for key, value in self._workspace_cli_environment().items() if key not in env})
         # SDK subprocesses merge options.env over their inherited process
         # environment. Never write an empty token here, because it would
-        # silently disable a valid process-level credential.
-        if use_local_claude_login:
-            # An explicit custom env entry could still accidentally override
-            # the OAuth-backed login.  Remove only these provider selectors;
-            # other administrator-provided SDK environment values remain.
-            env.pop("ANTHROPIC_AUTH_TOKEN", None)
-            env.pop("ANTHROPIC_BASE_URL", None)
-            env.pop("CLAUDE_CONFIG_DIR", None)
-        else:
+        # silently disable a valid process-level credential.  The built-in
+        # Claude Code profile intentionally leaves inherited values untouched:
+        # a service user may authenticate with either `claude login` or API
+        # billing environment variables.
+        if not use_local_claude_login:
             auth_token = self.settings.api_key or os.getenv("ANTHROPIC_AUTH_TOKEN")
             if auth_token:
                 env.setdefault("ANTHROPIC_AUTH_TOKEN", auth_token)
@@ -246,7 +254,10 @@ class AnthropicProvider(Provider):
             elif os.getenv("ANTHROPIC_BASE_URL"):
                 env.setdefault("ANTHROPIC_BASE_URL", os.environ["ANTHROPIC_BASE_URL"])
         options["env"] = {str(key): str(value) for key, value in env.items() if value is not None}
-        if "setting_sources" not in options and (not fields or "setting_sources" in fields):
+        if not use_local_claude_login and "setting_sources" not in options and (not fields or "setting_sources" in fields):
+            # Regular profiles use their project-scoped default for per-Agent
+            # isolation. The built-in local Claude Code profile leaves this
+            # unset, so the CLI retains its normal user/project behavior.
             options["setting_sources"] = ["project"]
         if options.get("mcp_servers") and (not fields or "strict_mcp_config" in fields):
             options.setdefault("strict_mcp_config", True)

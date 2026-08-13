@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 import uuid
 
@@ -10,7 +11,8 @@ from fastapi.testclient import TestClient
 from xmagents.config import AppPaths
 from xmagents.main import build_app
 from xmagents.service import AppService
-from xmagents.agents.runtime import AnthropicProvider
+from xmagents.agents.runtime import AnthropicProvider, RuntimeEvent
+from xmagents.models import IncomingMessage
 
 
 def _service(tmp_path: Path) -> AppService:
@@ -140,7 +142,7 @@ def test_agent_workspace_uses_unique_name_and_moves_on_rename(tmp_path: Path) ->
         service.create_agent("../not-a-workspace")
 
 
-def test_builtin_claude_code_profile_uses_local_login_without_api_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_builtin_claude_code_profile_keeps_inherited_login_and_billing_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     service = _service(tmp_path)
     profiles = service.list_api_profiles()
     builtin = next(profile for profile in profiles if profile["id"] == "builtin-claude-code")
@@ -154,13 +156,16 @@ def test_builtin_claude_code_profile_uses_local_login_without_api_env(tmp_path: 
 
     agent = service.create_agent("本机登录", api_profile_id="builtin-claude-code")
     settings = service._agent_settings(service._row("agents", agent["id"]) or {})
+    assert settings.extra["use_local_claude_code"] is True
     assert settings.extra["use_local_claude_code_login"] is True
-    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "should-not-be-injected")
-    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://should-not-be-injected.example")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "inherited-billing-token")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://billing.example/v1")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/tmp/claude-login")
+    monkeypatch.setattr("xmagents.agents.runtime.shutil.which", lambda name: "/opt/local/bin/claude" if name == "claude" else None)
 
     class FakeOptions:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
+        def __init__(self, *, cli_path=None, env=None, **kwargs):
+            self.kwargs = {"cli_path": cli_path, "env": env or {}, **kwargs}
 
     class FakeSDK:
         ClaudeAgentOptions = FakeOptions
@@ -169,9 +174,18 @@ def test_builtin_claude_code_profile_uses_local_login_without_api_env(tmp_path: 
     provider._sdk_module = FakeSDK
     options = provider._options()
     env = options.kwargs.get("env", {})
+    # The subprocess inherits this service-process environment. The builtin
+    # profile must not shadow a logged-in Claude config or API billing env.
+    inherited = {key: os.environ[key] for key in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CONFIG_DIR")}
+    effective = {**inherited, **env}
+    assert effective["ANTHROPIC_AUTH_TOKEN"] == "inherited-billing-token"
+    assert effective["ANTHROPIC_BASE_URL"] == "https://billing.example/v1"
+    assert effective["CLAUDE_CONFIG_DIR"] == "/tmp/claude-login"
     assert "ANTHROPIC_AUTH_TOKEN" not in env
     assert "ANTHROPIC_BASE_URL" not in env
     assert "CLAUDE_CONFIG_DIR" not in env
+    assert "setting_sources" not in options.kwargs
+    assert options.kwargs["cli_path"] == "/opt/local/bin/claude"
     assert not (Path(agent["workspace"]) / ".claude-config").exists()
 
 
@@ -218,3 +232,106 @@ def test_agent_create_api_returns_validation_error_for_duplicate_name(tmp_path: 
         response = client.post("/api/agents", json={"name": "Already-Here"}, headers={"X-XMAgent-CSRF": csrf})
     assert response.status_code == 400
     assert "名称已存在" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channel", ["wechat", "telegram"])
+async def test_private_peer_without_binding_is_retained_and_receives_unbound_notice(tmp_path: Path, channel: str) -> None:
+    service = _service(tmp_path)
+    account = service.create_channel(channel, f"{channel}-bot", token="token")
+    message = IncomingMessage(
+        channel=channel,
+        account_id=account["id"],
+        peer_id="private-user",
+        external_id=f"{channel}-first-message",
+        text="hello",
+        context_token="wechat-context" if channel == "wechat" else None,
+    )
+
+    events = await service.handle_incoming(message)
+
+    assert events == []
+    assert service.db.fetchone("SELECT COUNT(*) AS count FROM agents")["count"] == 0
+    peer = service.db.fetchone(
+        "SELECT * FROM remote_peers WHERE account_id=? AND external_id=?",
+        (account["id"], "private-user"),
+    )
+    assert peer is not None
+    assert [item["id"] for item in service.list_unbound_peers()] == [peer["id"]]
+    outbox = service.db.fetchone("SELECT peer_id,payload_json,state FROM outbox")
+    assert outbox is not None
+    assert outbox["peer_id"] == "private-user"
+    assert service.db.loads(outbox["payload_json"])["text"] == "未绑定agent，请联系管理员在管理台绑定agent后继续。"
+    assert outbox["state"] == "pending"
+
+
+def test_unbound_peers_include_previously_approved_peer_after_unbinding_and_pending_api(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    service.initialize_admin("1234567890")
+    account = service.create_channel("wechat", "wechat-bot", token="token")
+    agent = service.create_agent("已绑定 Agent")
+    peer = service.upsert_peer(account["id"], "wechat-user", approved=True)
+    service.bind_peer(peer["id"], agent["id"])
+
+    assert service.list_unbound_peers() == []
+    assert service.unbind_peer(peer["id"])
+    assert [item["id"] for item in service.list_unbound_peers()] == [peer["id"]]
+
+    service.control_socket_path = Path("/tmp") / f"xma-unbound-{uuid.uuid4().hex[:12]}.sock"
+    csrf = "unbound-peer-csrf"
+    with TestClient(build_app(service)) as client:
+        client.cookies.set("xmagents_session", service.create_session())
+        client.cookies.set("xmagents_csrf", csrf)
+        pending = client.get("/api/pending").json()
+    assert [item["id"] for item in pending] == [peer["id"]]
+    assert pending[0]["approved"] == 1
+
+
+def test_dashboard_and_rendered_webui_expose_unbound_channel_users(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    service.initialize_admin("1234567890")
+    account = service.create_channel("telegram", "dashboard-bot", token="token")
+    peer = service.upsert_peer(account["id"], "unbound-user", display_name="Unbound user")
+    service.control_socket_path = Path("/tmp") / f"xma-dashboard-view-{uuid.uuid4().hex[:12]}.sock"
+    csrf = "dashboard-view-csrf"
+
+    with TestClient(build_app(service)) as client:
+        client.cookies.set("xmagents_session", service.create_session())
+        client.cookies.set("xmagents_csrf", csrf)
+        dashboard = client.get("/api/dashboard").json()
+        page = client.get("/").text
+
+    assert [item["id"] for item in dashboard["pending"]] == [peer["id"]]
+    assert "待绑定渠道用户" in page
+    assert "window.setInterval(()=>void refreshInBackground(),5000)" in page
+    assert "restoreViewFromHash();" in page
+
+
+@pytest.mark.asyncio
+async def test_allowed_telegram_group_keeps_shared_agent_route(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    account = service.create_channel("telegram", "group-bot", token="token", config={"group_allowlist": ["-100"]})
+    submitted: list[str] = []
+
+    class FakeRuntime:
+        async def submit(self, text, _context, *, on_event=None):
+            submitted.append(text)
+            events = [RuntimeEvent("text", "group reply")]
+            if on_event is not None:
+                for event in events:
+                    await on_event(event)
+            return events
+
+    service.runtime_for = lambda _agent_id: FakeRuntime()  # type: ignore[method-assign]
+    first = IncomingMessage("telegram", account["id"], "-100", "group-1", text="first", kind="group")
+    second = IncomingMessage("telegram", account["id"], "-100", "group-2", text="second", kind="group")
+
+    await service.handle_incoming(first)
+    await service.handle_incoming(second)
+
+    assert submitted == ["first", "second"]
+    assert service.db.fetchone("SELECT COUNT(*) AS count FROM agents")["count"] == 1
+    peer = service.db.fetchone("SELECT id FROM remote_peers WHERE account_id=? AND external_id=?", (account["id"], "-100"))
+    assert peer is not None and service.binding_for_peer(peer["id"]) is not None
+    notices = service.db.fetchall("SELECT payload_json FROM outbox ORDER BY created_at")
+    assert all(service.db.loads(item["payload_json"]).get("text") != "未绑定agent，请联系管理员在管理台绑定agent后继续。" for item in notices)

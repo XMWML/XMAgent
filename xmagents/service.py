@@ -33,6 +33,7 @@ from .models import DeliveryResult
 OUTBOX_LEASE_SECONDS = 120
 OUTBOX_MAX_ATTEMPTS = 8
 OUTBOX_IDLE_SECONDS = 1.0
+UNBOUND_AGENT_MESSAGE = "未绑定agent，请联系管理员在管理台绑定agent后继续。"
 
 
 class AppService:
@@ -591,9 +592,10 @@ class AppService:
         config = self.db.loads(row.get("config_json"), {})
         profile = None
         if row.get("api_profile_id") == "builtin-claude-code":
-            # Do not inject an API key or base URL.  Claude Code uses the
-            # existing login state available to the service user.
-            config.setdefault("use_local_claude_code_login", True)
+            # Do not inject an API key or base URL. Claude Code uses the
+            # service user's own login state or inherited API billing env.
+            config["use_local_claude_code"] = True
+            config["use_local_claude_code_login"] = True
         elif row.get("api_profile_id"):
             profile = self.db.fetchone("SELECT * FROM api_profiles WHERE id=?", (row["api_profile_id"],))
         if profile:
@@ -1003,18 +1005,22 @@ class AppService:
         )
         peer = self.upsert_peer(account_id, str(message.peer_id), chat_id=str(message.peer_id) if message.kind != "private" else None,
                                 display_name=getattr(message, "sender_name", ""), kind=getattr(message, "kind", "private"),
-                                approved=channel == "wechat" or is_allowed_group)
+                                approved=is_allowed_group)
         agent_binding = self.binding_for_peer(peer["id"])
-        if not agent_binding and (channel == "wechat" or is_allowed_group):
-            label = getattr(message, "sender_name", "") or (f"Telegram 群组-{message.peer_id}" if is_allowed_group else f"微信-{message.peer_id}")
+        if not agent_binding and is_allowed_group:
+            label = getattr(message, "sender_name", "") or f"Telegram 群组-{message.peer_id}"
             agent = self.create_agent(self._next_available_agent_name(label, fallback_id=str(peer["id"])))
-            agent_binding = self.bind_peer(str(peer["id"]), str(agent["id"]))
+            self.bind_peer(str(peer["id"]), str(agent["id"]))
+            # ``bind_peer`` returns a routing row, while downstream runtime
+            # code requires the Agent-shaped record returned by
+            # ``binding_for_peer``.
+            agent_binding = self.binding_for_peer(str(peer["id"]))
         # All attachment paths injected into prompts must be files verified in
-        # the bound workspace.  This matters for a first WeChat message: its
-        # Agent is created just above, so downloading earlier would stage
-        # bytes under an unassigned shared directory.
+        # the bound workspace.  Unbound private peers have no workspace, so
+        # their attachments deliberately remain with the channel provider
+        # until an administrator creates a route.
         needs_download = any(not str(getattr(item, "path", "") or "") for item in getattr(message, "attachments", []) or [])
-        if needs_download and agent_binding and int(agent_binding.get("approved", 0)):
+        if needs_download and agent_binding:
             adapter = self.channels.get(account_id)
             if adapter is not None:
                 try:
@@ -1028,9 +1034,13 @@ class AppService:
         # results stay deferred until a later message yields a fresh token.
         if channel == "wechat":
             await self._flush_wechat_deferred(account_id, str(message.peer_id), getattr(message, "context_token", None))
-        if not agent_binding or not int(agent_binding.get("approved", 0)):
-            if channel == "telegram":
-                await self.send_message(account_id, str(message.peer_id), "此 Telegram 用户尚未获管理员批准。", context_token=getattr(message, "context_token", None))
+        if not agent_binding:
+            await self.send_message(
+                account_id,
+                str(message.peer_id),
+                UNBOUND_AGENT_MESSAGE,
+                context_token=getattr(message, "context_token", None),
+            )
             return []
         runtime = self.runtime_for(agent_binding["id"])
         conversation = self.conversation(agent_binding["id"], str(message.peer_id))
@@ -1395,7 +1405,7 @@ class AppService:
 
     def update_api_profile(self, profile_id: str, values: dict[str, Any]) -> dict[str, Any]:
         if profile_id == "builtin-claude-code":
-            raise ValueError("内置 Claude Code 登录 profile 不能编辑")
+            raise ValueError("内置 Claude Code profile 不能编辑")
         row = self._row("api_profiles", profile_id)
         if not row:
             raise KeyError(profile_id)
@@ -1420,7 +1430,7 @@ class AppService:
 
     def delete_api_profile(self, profile_id: str) -> None:
         if profile_id == "builtin-claude-code":
-            raise ValueError("内置 Claude Code 登录 profile 不能删除")
+            raise ValueError("内置 Claude Code profile 不能删除")
         agent_ids = [str(item["id"]) for item in self.db.fetchall("SELECT id FROM agents WHERE api_profile_id=?", (profile_id,))]
         self.db.execute("DELETE FROM api_profiles WHERE id=?", (profile_id,))
         for agent_id in agent_ids:
@@ -1612,6 +1622,23 @@ class AppService:
             (peer_id, account_id, external_id, chat_id, display_name, kind, int(approved), now, now),
         )
         return self._row("remote_peers", peer_id) or {}
+
+    def list_unbound_peers(self) -> list[dict[str, Any]]:
+        """Return every channel peer without an active Agent route.
+
+        ``approved`` is retained for compatibility and control-socket scope,
+        but it is not a routing decision any more.  A peer becomes actionable
+        only after an active binding exists, and an explicitly unbound peer
+        must return here even if it was approved before.
+        """
+
+        rows = self.db.fetchall(
+            "SELECT p.*,c.channel,c.name AS account_name "
+            "FROM remote_peers p JOIN channel_accounts c ON c.id=p.account_id "
+            "LEFT JOIN agent_bindings b ON b.peer_id=p.id AND b.active=1 "
+            "WHERE b.id IS NULL ORDER BY p.updated_at DESC,p.created_at DESC"
+        )
+        return [dict(row) for row in rows]
 
     def list_bindings(self, *, peer_id: str | None = None, agent_id: str | None = None,
                       active_only: bool = True) -> list[dict[str, Any]]:

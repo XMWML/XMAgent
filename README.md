@@ -7,7 +7,7 @@ XMAgent 是自托管多渠道 Agent 服务。它将微信 iLink 联系人、Tele
 ## 功能概览
 
 - 多个微信 iLink 和 Telegram Bot 账号；Telegram 支持每 Bot 独立 HTTP proxy。
-- 微信二维码登录（一次扫码确认只创建一个渠道）、Telegram 待审批私聊、群组白名单和每群共享 Agent。
+- 微信二维码登录（一次扫码确认只创建一个渠道）、微信和 Telegram 私聊的统一待绑定流程、群组白名单和每群共享 Agent。
 - 可视化渠道路由：每个联系人或群组明确绑定一个 Agent，可在 WebUI 随时重绑。
 - 每个 Agent 独立工作区、持久化历史、串行邮箱、多轮 Claude SDK 会话和 OpenAI-compatible Chat Completions SSE。
 - `/new`、`/effort`、`/status`、`/help`、`/sendfile`，以及 Claude 工具状态和 Telegram 流式编辑回复。
@@ -43,9 +43,9 @@ python3 -m venv .venv
 
 ## 主要行为
 
-- 微信联系人首条消息会自动创建并绑定独立 Agent；Telegram 私聊必须在 WebUI 审批后才会创建 Agent。所有联系人/群组到 Agent 的对应关系可在“渠道与扫码”页面查看和重绑。
+- 微信和 Telegram 私聊的首条消息都会进入“待绑定渠道用户”，并回复 `未绑定agent，请联系管理员在管理台绑定agent后继续。`。管理员可为其新建独立 Agent 或绑定既有 Agent；绑定后，用户下一条消息开始进入相应 Agent。所有联系人/群组到 Agent 的对应关系可在“渠道与扫码”页面查看和重绑。
 - Telegram 白名单群组每群一个共享 Agent，只处理命令、@Bot 或回复 Bot 的消息。
-- Anthropic profile 通过 `ANTHROPIC_AUTH_TOKEN` 和 `ANTHROPIC_BASE_URL` 注入 Claude SDK 子进程；也可直接选择内置“本机 Claude Code 登录” profile，服务用户先执行 `claude login` 即可。OpenAI-compatible profile 调用 Chat Completions SSE。
+- 内置“本机 Claude Code” profile 优先调用运行服务用户安装的 `claude`，复用其认证和设置；它既可使用该用户的 `claude login` 状态，也可继承服务进程的 `ANTHROPIC_AUTH_TOKEN` 与 `ANTHROPIC_BASE_URL` API/计费环境变量。普通 Anthropic profile 使用保存的 API 配置；OpenAI-compatible profile 调用 Chat Completions SSE。
 - Telegram 回复会以一条可编辑消息流式呈现，超长结果自动分段。微信单账号默认最小发送间隔为 1.5 秒，文本按段落/句子拆分以降低限频风险。
 - 渠道凭据、API key 和 MCP headers 保存在 SQLite 中，WebUI/API 只显示是否已配置或掩码。
 

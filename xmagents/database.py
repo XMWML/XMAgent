@@ -156,16 +156,17 @@ class Database:
         with self.connect() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.executescript(SCHEMA)
-            # This protected profile intentionally has no secret.  Selecting
-            # it tells the Claude SDK child to use the service user's existing
-            # Claude Code login rather than an API token stored by XMAgent.
+            # This protected profile intentionally has no secret. Selecting it
+            # tells the Claude SDK child to use the service user's existing
+            # Claude Code environment: either `claude login` or inherited API
+            # billing variables. Keep its id/options stable for existing DBs.
             now = utcnow()
             connection.execute(
                 "INSERT OR IGNORE INTO api_profiles(id,name,provider,base_url,models_json,secret,options_json,enabled,created_at,updated_at) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
                     "builtin-claude-code",
-                    "本机 Claude Code 登录",
+                    "本机 Claude Code",
                     "anthropic",
                     None,
                     "[]",
@@ -175,6 +176,13 @@ class Database:
                     now,
                     now,
                 ),
+            )
+            # Earlier versions displayed "登录" in the immutable profile's
+            # name. Migrate that presentation text without changing profile
+            # identity or its authentication behavior.
+            connection.execute(
+                "UPDATE api_profiles SET name=?,updated_at=? WHERE id=? AND name=?",
+                ("本机 Claude Code", now, "builtin-claude-code", "本机 Claude Code 登录"),
             )
         self._chmod_database_files()
 

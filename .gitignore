@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.uv-cache/
 .venv/
 venv/
 xmagents.egg-info/
